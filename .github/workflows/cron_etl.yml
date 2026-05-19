@@ -1,0 +1,34 @@
+name: Camion ETL Diario Bad Bunny
+
+on:
+  schedule:
+    # ⏰ Corre todos los días a las 23:00 UTC (Aproximadamente 20:00 hs de Argentina)
+    - cron: '0 23 * * *'
+  workflow_dispatch: # 👈 Esto nos permite darle un botón de "Play" manual para probarlo
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest # Arma una computadora virtual con Linux gratis
+
+    steps:
+    - name: Copiar el repositorio
+      uses: actions/checkout@v3
+
+    - name: Configurar Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.14' # 👈 Ajustado a tu versión de desarrollo
+
+    - name: Instalar librerias necesarias
+      run: |
+        pip install requests supabase
+
+    - name: Ejecutar camión ETL 🚛
+      env:
+        # Conectamos las variables del script con la caja fuerte de GitHub
+        LASTFM_KEY: ${{ secrets.LASTFM_KEY }}
+        SETLIST_KEY: ${{ secrets.SETLIST_KEY }}
+        TICKETMASTER_KEY: ${{ secrets.TICKETMASTER_KEY }}
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      run: python etl.py
