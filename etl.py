@@ -46,22 +46,32 @@ for track in lista_canciones:
         "oyentes": int(track['listeners']), "reproducciones": int(track['playcount'])
     })
 
-# -- SETLIST.FM (Pasado) --
+# -- SETLIST.FM (Pasado - Últimos 5 shows) --
 url_setlist = f"https://api.setlist.fm/rest/1.0/artist/{MBID_ARTISTA}/setlists?p=1"
 datos_setlist = requests.get(url_setlist, headers={"Accept": "application/json", "x-api-key": SETLIST_KEY}).json()
-concierto_pasado = {}
+
+paquete_conciertos_pasados = []  # 👈 Ahora es una lista vacía
+shows_a_traer = 5 
+contador = 0
 
 for show in datos_setlist.get('setlist', []):
     fecha_orig = show.get('eventDate', '')
     if "2025" in fecha_orig or "2026" in fecha_orig:
         partes = fecha_orig.split('-')
-        concierto_pasado = {
+        
+        # 👈 Guardamos cada show en la lista con .append()
+        paquete_conciertos_pasados.append({
             "fecha": f"{partes[2]}-{partes[1]}-{partes[0]}",
-            "ciudad": show['venue']['city']['name'], "pais": show['venue']['city'].get('country', {}).get('name', 'Desconocido')
-        }
-        break
+            "ciudad": show['venue']['city']['name'], 
+            "pais": show['venue']['city'].get('country', {}).get('name', 'Desconocido')
+        })
+        
+        # 👈 Sumamos 1 al contador y frenamos recién cuando llega a 5
+        contador += 1
+        if contador == shows_a_traer:
+            break
 
-# -- TICKETMASTER (Futuro) --
+# -- TICKETMASTER (Futuro - Próximos 3 shows) --
 url_tm = f"https://app.ticketmaster.com/discovery/v2/events.json?keyword={ARTISTA}&apikey={TICKETMASTER_KEY}"
 datos_tm = requests.get(url_tm).json()
 paquete_conciertos_futuros = []
@@ -117,7 +127,7 @@ for cancion in paquete_canciones:
 
 # C. Cargar FACTS de CONCIERTOS
 print("Subiendo historial y cartelera de conciertos...")
-todos_los_conciertos = [concierto_pasado] + paquete_conciertos_futuros
+todos_los_conciertos = paquete_conciertos_pasados + paquete_conciertos_futuros
 
 for show in todos_los_conciertos:
     if not show: continue # Por si no encontró show pasado
