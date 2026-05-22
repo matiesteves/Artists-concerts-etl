@@ -47,7 +47,7 @@ for track in lista_canciones:
     })
 
 # -- SETLIST.FM (Pasado - Últimos 5 shows) --
-url_setlist = f"https://api.setlist.fm/rest/1.0/artist/{MBID_ARTISTA}/setlists?p=1"
+url_setlist = f"https://api.setlist.fm/rest/1.0/artist/{MBID_ARTISTA}/setlists?p=4"
 datos_setlist = requests.get(url_setlist, headers={"Accept": "application/json", "x-api-key": SETLIST_KEY}).json()
 
 paquete_conciertos_pasados = []  # 👈 Ahora es una lista vacía
