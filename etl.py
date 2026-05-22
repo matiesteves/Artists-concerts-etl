@@ -136,3 +136,5 @@ for show in todos_los_conciertos:
     }).execute()
 
 print("\n✅ ¡ETL COMPLETADO CON ÉXITO! Todos los datos están en tu Data Warehouse.")
+
+#prueba(?)
