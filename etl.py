@@ -56,7 +56,7 @@ contador = 0
 
 for show in datos_setlist.get('setlist', []):
     fecha_orig = show.get('eventDate', '')
-    if "2025" in fecha_orig or "2026" in fecha_orig:
+    if "2024" in fecha_orig or "2025" in fecha_orig or "2026" in fecha_orig:
         partes = fecha_orig.split('-')
         
         # 👈 Guardamos cada show en la lista con .append()
