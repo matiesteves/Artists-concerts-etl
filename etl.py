@@ -6,7 +6,7 @@ import json
 from supabase import create_client, Client # 👈 ¡NUEVA HERRAMIENTA!
 
 # ==========================================
-# 🔑 LLAVES MAESTRAS DESDE LA CAJA FUERTE DE GITHUB
+# LLAVES MAESTRAS DESDE LA CAJA FUERTE DE GITHUB
 # ==========================================
 LASTFM_KEY = os.environ.get("LASTFM_KEY")
 SETLIST_KEY = os.environ.get("SETLIST_KEY")
@@ -59,14 +59,14 @@ for show in datos_setlist.get('setlist', []):
     if "2024" in fecha_orig or "2025" in fecha_orig or "2026" in fecha_orig:
         partes = fecha_orig.split('-')
         
-        # 👈 Guardamos cada show en la lista con .append()
+        # Guardamos cada show en la lista con .append()
         paquete_conciertos_pasados.append({
             "fecha": f"{partes[2]}-{partes[1]}-{partes[0]}",
             "ciudad": show['venue']['city']['name'], 
             "pais": show['venue']['city'].get('country', {}).get('name', 'Desconocido')
         })
         
-        # 👈 Sumamos 1 al contador y frenamos recién cuando llega a 5
+        # Sumamos 1 al contador y frenamos recién cuando llega a 5
         contador += 1
         if contador == shows_a_traer:
             break
@@ -85,7 +85,7 @@ if '_embedded' in datos_tm:
         })
 
 # ==========================================
-# 2️⃣ CARGA (L) A SUPABASE 🥶
+# 2️⃣ CARGA (L) A SUPABASE 
 # ==========================================
 print("\n🧊 ABRIENDO COMPUERTAS HACIA SUPABASE...")
 
