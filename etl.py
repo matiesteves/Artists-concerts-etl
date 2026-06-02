@@ -3,7 +3,7 @@ import requests
 import time
 from datetime import date
 import json
-from supabase import create_client, Client # 👈 ¡NUEVA HERRAMIENTA!
+from supabase import create_client, Client #  ¡NUEVA HERRAMIENTA!
 
 # ==========================================
 # LLAVES MAESTRAS DESDE LA CAJA FUERTE DE GITHUB
