@@ -1,305 +1,383 @@
-from datetime import date
-import json
+"""ETL de artistas y conciertos hacia un Data Warehouse en Supabase (esquema estrella).
+
+Fuentes : Last.fm (estadísticas y top canciones), Setlist.fm (shows pasados),
+          Ticketmaster Discovery (shows futuros).
+Destino : dim_artista (SCD Tipo 2), dim_cancion, dim_ubicacion, dim_fecha,
+          fact_reproducciones, fact_conciertos.
+
+El script es idempotente: las cargas de hechos usan UPSERT sobre las claves únicas
+del modelo, por lo que correrlo varias veces el mismo día no genera duplicados.
+"""
+
 import os
+import sys
 import time
+from datetime import date, datetime
+
 import requests
 from supabase import Client, create_client
 
 # ==========================================
-# LLAVES MAESTRAS DESDE LA CAJA FUERTE DE GITHUB
+# CONFIGURACIÓN
 # ==========================================
-LASTFM_KEY = os.environ.get("LASTFM_KEY")
-SETLIST_KEY = os.environ.get("SETLIST_KEY")
-TICKETMASTER_KEY = os.environ.get("TICKETMASTER_KEY")
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+ARTISTAS = [
+    {"nombre": "Bad Bunny", "mbid": "89aa5ecb-59ad-46f5-b3eb-2d424e941f19", "genero": "Urbano"},
+    {"nombre": "Karol G", "mbid": "de222709-0926-4f6c-b89c-2142b1745238", "genero": "Urbano"},
+    {"nombre": "Feid", "mbid": "e2a38a67-c21b-444f-8558-87822e4f8f50", "genero": "Urbano"},
+    {"nombre": "Rauw Alejandro", "mbid": "5f810209-6463-444f-8a6b-a30992d65b73", "genero": "Urbano"},
+    {"nombre": "Coldplay", "mbid": "cc197bad-dc9c-440d-a5b5-d52ba2e14234", "genero": "Pop Rock"},
+    {"nombre": "Taylor Swift", "mbid": "20244d07-534f-4eff-b4d4-930878889970", "genero": "Pop"},
+]
 
-# Iniciamos el cliente de Supabase
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+TOP_CANCIONES = 5
+SHOWS_PASADOS = 5
+SHOWS_FUTUROS = 3
+UMBRAL_CAMBIO_OYENTES = 0.01  # una variación >= 1% abre una nueva versión SCD2
+HTTP_TIMEOUT = 20
 
-ARTISTA = "Bad Bunny"
-MBID_ARTISTA = "89aa5ecb-59ad-46f5-b3eb-2d424e941f19"
-fecha_hoy = str(date.today())
+LASTFM_URL = "https://ws.audioscrobbler.com/2.0/"
+SETLIST_URL = "https://api.setlist.fm/rest/1.0/artist/{mbid}/setlists"
+TICKETMASTER_URL = "https://app.ticketmaster.com/discovery/v2/events.json"
 
-print(f"🚀 INICIANDO CAMIÓN ETL PARA {ARTISTA.upper()} - {fecha_hoy}\n")
+HOY = date.today()
+
+
+def leer_entorno(nombre: str) -> str:
+    valor = os.environ.get(nombre)
+    if not valor:
+        sys.exit(f"❌ Falta la variable de entorno {nombre}")
+    return valor
+
 
 # ==========================================
-# 1️⃣ EXTRACCIÓN Y TRANSFORMACIÓN
+# UTILIDADES
 # ==========================================
-print("📦 Extrayendo y transformando datos de APIs...")
+def get_json(url: str, **kwargs) -> dict:
+    """GET con 3 reintentos ante errores de red o rate limit. Devuelve {} si falla."""
+    for intento in range(3):
+        try:
+            resp = requests.get(url, timeout=HTTP_TIMEOUT, **kwargs)
+            if resp.status_code == 429:
+                time.sleep(2 * (intento + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            print(f"   ⚠️ {url.split('?')[0]} intento {intento + 1}/3: {exc}")
+            time.sleep(1.5 * (intento + 1))
+    return {}
 
-# -- A. LAST.FM (Estadísticas globales del artista para SCD Tipo 2) --
-url_artist_info = f"http://ws.audioscrobbler.com/2.0/?method=artist.getinfo&artist={ARTISTA}&api_key={LASTFM_KEY}&format=json"
-try:
-  stats_artista = (
-      requests.get(url_artist_info, timeout=15)
-      .json()
-      .get("artist", {})
-      .get("stats", {})
-  )
-  oyentes_globales_hoy = int(stats_artista.get("listeners", 0))
-except Exception:
-  oyentes_globales_hoy = 0
 
-if oyentes_globales_hoy >= 3500000:
-  nivel_popularidad_hoy = "Fenómeno Global (Tier S)"
-elif oyentes_globales_hoy >= 2000000:
-  nivel_popularidad_hoy = "Headliner Internacional (Tier A)"
-else:
-  nivel_popularidad_hoy = "Consolidado (Tier B)"
+def clasificar_popularidad(oyentes: int) -> str:
+    if oyentes >= 3_500_000:
+        return "Fenómeno Global (Tier S)"
+    if oyentes >= 2_000_000:
+        return "Headliner Internacional (Tier A)"
+    return "Consolidado (Tier B)"
 
-# -- B. LAST.FM (Top 5 Canciones) --
-url_top = f"http://ws.audioscrobbler.com/2.0/?method=artist.gettoptracks&artist={ARTISTA}&api_key={LASTFM_KEY}&format=json"
-lista_canciones = (
-    requests.get(url_top, timeout=15)
-    .json()
-    .get("toptracks", {})
-    .get("track", [])[:5]
-)
-paquete_canciones = []
 
-for track in lista_canciones:
-  nombre_cancion = track["name"]
-  url_info = f"http://ws.audioscrobbler.com/2.0/?method=track.getInfo&api_key={LASTFM_KEY}&artist={ARTISTA}&track={nombre_cancion}&format=json"
-  try:
-    nombre_album = requests.get(url_info, timeout=15).json()["track"]["album"][
-        "title"
+def id_fecha_de(d: date) -> int:
+    return int(d.strftime("%Y%m%d"))
+
+
+# ==========================================
+# EXTRACCIÓN
+# ==========================================
+def extraer_lastfm_artista(nombre: str, api_key: str) -> dict:
+    data = get_json(
+        LASTFM_URL,
+        params={"method": "artist.getinfo", "artist": nombre, "api_key": api_key, "format": "json"},
+    )
+    stats = data.get("artist", {}).get("stats", {})
+    return {
+        "oyentes": int(stats.get("listeners") or 0),
+        "reproducciones": int(stats.get("playcount") or 0),
+    }
+
+
+def extraer_lastfm_top_canciones(nombre: str, api_key: str) -> list[dict]:
+    data = get_json(
+        LASTFM_URL,
+        params={
+            "method": "artist.gettoptracks", "artist": nombre,
+            "api_key": api_key, "format": "json", "limit": TOP_CANCIONES,
+        },
+    )
+    tracks = data.get("toptracks", {}).get("track", [])[:TOP_CANCIONES]
+    return [
+        {
+            "titulo": t["name"],
+            "oyentes": int(t.get("listeners") or 0),
+            "reproducciones": int(t.get("playcount") or 0),
+        }
+        for t in tracks
     ]
-  except Exception:
-    nombre_album = "Sencillo / Sin Álbum"
 
-  paquete_canciones.append({
-      "titulo": nombre_cancion,
-      "album": nombre_album,
-      "oyentes": int(track.get("listeners", 0)),
-      "reproducciones": int(track.get("playcount", 0)),
-  })
 
-# -- C. SETLIST.FM (Pasado - Últimos 5 shows realizados con conteo real de canciones) --
-url_setlist = f"https://api.setlist.fm/rest/1.0/artist/{MBID_ARTISTA}/setlists?p=1"
-datos_setlist = requests.get(
-    url_setlist,
-    headers={"Accept": "application/json", "x-api-key": SETLIST_KEY},
-    timeout=15,
-).json()
-
-paquete_conciertos_pasados = []
-shows_a_traer = 5
-contador = 0
-
-for show in datos_setlist.get("setlist", []):
-  fecha_orig = show.get("eventDate", "")
-  if (
-      "2024" in fecha_orig
-      or "2025" in fecha_orig
-      or "2026" in fecha_orig
-  ):
-    partes = fecha_orig.split("-")
-    venue_data = show.get("venue", {})
-    city_data = venue_data.get("city", {})
-    ciudad_nombre = city_data.get("name")
-    if not ciudad_nombre:
-      continue
-
-    # Contamos cuántas canciones reales tuvo el setlist del show
-    sets_lista = show.get("sets", {}).get("set", [])
-    total_canciones_show = sum(
-        len(bloque.get("song", [])) for bloque in sets_lista
+def extraer_album(nombre: str, titulo: str, api_key: str) -> str:
+    data = get_json(
+        LASTFM_URL,
+        params={
+            "method": "track.getInfo", "artist": nombre, "track": titulo,
+            "api_key": api_key, "format": "json",
+        },
     )
+    return data.get("track", {}).get("album", {}).get("title") or "Sencillo / Sin Álbum"
 
-    paquete_conciertos_pasados.append({
-        "fecha": f"{partes[2]}-{partes[1]}-{partes[0]}",
-        "ciudad": ciudad_nombre,
-        "pais": city_data.get("country", {}).get("name", "Desconocido"),
-        "cantidad_canciones_tocadas": total_canciones_show,
-        "show_realizado": 1,
-    })
 
-    contador += 1
-    if contador == shows_a_traer:
-      break
+def extraer_shows_pasados(artista: dict, api_key: str) -> list[dict]:
+    """Últimos shows realizados (Setlist.fm) con el conteo real de canciones tocadas."""
+    data = get_json(
+        SETLIST_URL.format(mbid=artista["mbid"]),
+        params={"p": 1},
+        headers={"Accept": "application/json", "x-api-key": api_key},
+    )
+    shows = []
+    for show in data.get("setlist", []):
+        try:
+            fecha = datetime.strptime(show.get("eventDate", ""), "%d-%m-%Y").date()
+        except ValueError:
+            continue
+        if fecha > HOY:
+            continue
+        ciudad = show.get("venue", {}).get("city", {})
+        if not ciudad.get("name"):
+            continue
+        bloques = show.get("sets", {}).get("set", [])
+        canciones = sum(len(b.get("song", [])) for b in bloques)
+        shows.append({
+            "fecha": fecha,
+            "ciudad": ciudad["name"],
+            "pais": ciudad.get("country", {}).get("name", "Desconocido"),
+            "cantidad_canciones_tocadas": canciones,
+            "show_realizado": 1,
+        })
+        if len(shows) == SHOWS_PASADOS:
+            break
+    return shows
 
-# -- D. TICKETMASTER (Futuro - Próximos 3 shows blindado contra KeyError '_embedded') --
-url_tm = f"https://app.ticketmaster.com/discovery/v2/events.json?keyword={ARTISTA}&apikey={TICKETMASTER_KEY}"
-datos_tm = requests.get(url_tm, timeout=15).json()
-paquete_conciertos_futuros = []
 
-eventos_tm = datos_tm.get("_embedded", {}).get("events", [])
-for evento in eventos_tm:
-  # Evitamos el KeyError: '_embedded' si el evento es virtual, paquete VIP o sin estadio asignado
-  venues_tm = evento.get("_embedded", {}).get("venues", [])
-  if not venues_tm:
-    continue
+def extraer_shows_futuros(artista: dict, api_key: str) -> list[dict]:
+    """Próximos shows (Ticketmaster). Omite eventos virtuales o sin recinto físico."""
+    data = get_json(
+        TICKETMASTER_URL,
+        params={
+            "keyword": artista["nombre"], "classificationName": "music",
+            "sort": "date,asc", "size": 30, "apikey": api_key,
+        },
+    )
+    shows = []
+    for evento in data.get("_embedded", {}).get("events", []):
+        embebido = evento.get("_embedded", {})
+        venues = embebido.get("venues", [])
+        if not venues:
+            continue  # evento virtual / paquete VIP / sin recinto
 
-  venue_principal = venues_tm[0]
-  ciudad_tm = venue_principal.get("city", {}).get("name")
-  fecha_tm = evento.get("dates", {}).get("start", {}).get("localDate")
-  if not ciudad_tm or not fecha_tm:
-    continue
+        atracciones = [a.get("name", "").lower() for a in embebido.get("attractions", [])]
+        if atracciones and artista["nombre"].lower() not in atracciones:
+            continue  # coincidencia por keyword de otro artista (tributos, etc.)
 
-  paquete_conciertos_futuros.append({
-      "fecha": fecha_tm,
-      "ciudad": ciudad_tm,
-      "pais": venue_principal.get("country", {}).get("name", "Desconocido"),
-      "cantidad_canciones_tocadas": 0,
-      "show_realizado": 0,
-  })
+        venue = venues[0]
+        ciudad = venue.get("city", {}).get("name")
+        fecha_txt = evento.get("dates", {}).get("start", {}).get("localDate")
+        if not ciudad or not fecha_txt:
+            continue
+        try:
+            fecha = date.fromisoformat(fecha_txt)
+        except ValueError:
+            continue
+        if fecha <= HOY:
+            continue
+        shows.append({
+            "fecha": fecha,
+            "ciudad": ciudad,
+            "pais": venue.get("country", {}).get("name", "Desconocido"),
+            "cantidad_canciones_tocadas": 0,
+            "show_realizado": 0,
+        })
+        if len(shows) == SHOWS_FUTUROS:
+            break
+    return shows
 
-  if len(paquete_conciertos_futuros) == 3:
-    break
 
 # ==========================================
-# 2️⃣ CARGA (L) A SUPABASE
+# CARGA: DIMENSIONES
 # ==========================================
-print("\n🧊 ABRIENDO COMPUERTAS HACIA SUPABASE...")
-
-# A. Cargar/Actualizar DIM_ARTISTA con soporte histórico (SCD Tipo 2)
-res_artista = (
-    supabase.table("dim_artista")
-    .select("*")
-    .eq("nombre", ARTISTA)
-    .order("id_artista", desc=True)
-    .execute()
-)
-
-if not res_artista.data:
-  # Primera inserción si no existe el artista
-  nuevo_artista = {
-      "nombre": ARTISTA,
-      "genero_principal": "Urbano",
-      "oyentes_globales": oyentes_globales_hoy,
-      "nivel_popularidad": nivel_popularidad_hoy,
-      "fecha_desde": fecha_hoy,
-      "fecha_hasta": None,
-      "es_actual": True,
-  }
-  try:
-    res_ins = supabase.table("dim_artista").insert(nuevo_artista).execute()
-  except Exception:
-    res_ins = (
-        supabase.table("dim_artista")
-        .insert({"nombre": ARTISTA, "genero_principal": "Urbano"})
-        .execute()
-    )
-  id_artista_db = res_ins.data[0]["id_artista"]
-else:
-  # Verificamos el registro vigente (SCD Tipo 2)
-  reg_actual = res_artista.data[0]
-  id_artista_db = reg_actual["id_artista"]
-
-  # Si la tabla ya tiene las columnas SCD Tipo 2 y cambió el escalafón o los oyentes globales (>1% de variación)
-  if "es_actual" in reg_actual and oyentes_globales_hoy > 0:
-    oyentes_previos = reg_actual.get("oyentes_globales") or 0
-    cambio_significativo = abs(oyentes_globales_hoy - oyentes_previos) >= 5000
-    if oyentes_previos == 0:
-      # Inicializamos los campos SCD2 en el registro actual si estaban vacíos
-      supabase.table("dim_artista").update({
-          "oyentes_globales": oyentes_globales_hoy,
-          "nivel_popularidad": nivel_popularidad_hoy,
-          "fecha_desde": reg_actual.get("fecha_desde") or fecha_hoy,
-          "es_actual": True,
-      }).eq("id_artista", id_artista_db).execute()
-    elif cambio_significativo:
-      # 1. Cerramos la vigencia del registro histórico anterior
-      supabase.table("dim_artista").update({
-          "fecha_hasta": fecha_hoy,
-          "es_actual": False,
-      }).eq("id_artista", id_artista_db).execute()
-
-      # 2. Insertamos la nueva versión vigente (SCD Tipo 2)
-      res_nuevo = (
-          supabase.table("dim_artista")
-          .insert({
-              "nombre": ARTISTA,
-              "genero_principal": reg_actual.get("genero_principal", "Urbano"),
-              "oyentes_globales": oyentes_globales_hoy,
-              "nivel_popularidad": nivel_popularidad_hoy,
-              "fecha_desde": fecha_hoy,
-              "fecha_hasta": None,
-              "es_actual": True,
-          })
-          .execute()
-      )
-      id_artista_db = res_nuevo.data[0]["id_artista"]
+def versiones_artista(sb: Client, nombre: str) -> list[dict]:
+    res = sb.table("dim_artista").select("*").eq("nombre", nombre).order("fecha_desde").execute()
+    return res.data
 
 
-# Función auxiliar para procesar fechas (Convierte "2026-05-18" en ID 20260518)
-def obtener_id_fecha(fecha_str):
-  partes = fecha_str.split("-")
-  id_f = int(f"{partes[0]}{partes[1]}{partes[2]}")
-  res_f = (
-      supabase.table("dim_fecha").select("id_fecha").eq("id_fecha", id_f).execute()
-  )
-  if not res_f.data:
-    trimestre = (int(partes[1]) - 1) // 3 + 1
-    supabase.table("dim_fecha").insert({
-        "id_fecha": id_f,
-        "anio": int(partes[0]),
-        "mes": int(partes[1]),
-        "dia": int(partes[2]),
-        "trimestre": trimestre,
-    }).execute()
-  return id_f
+def resolver_version(versiones: list[dict], fecha: date) -> int:
+    """Devuelve el id_artista de la versión SCD2 vigente en `fecha` (o la más cercana)."""
+    for v in versiones:
+        desde = date.fromisoformat(v["fecha_desde"])
+        hasta = date.fromisoformat(v["fecha_hasta"]) if v["fecha_hasta"] else None
+        if desde <= fecha and (hasta is None or fecha < hasta):
+            return v["id_artista"]
+    return versiones[0]["id_artista"] if fecha < date.fromisoformat(versiones[0]["fecha_desde"]) else versiones[-1]["id_artista"]
 
 
-# B. Cargar FACTS de REPRODUCCIONES
-id_fecha_hoy_db = obtener_id_fecha(fecha_hoy)
-print("Subiendo métricas de canciones...")
+def aplicar_scd2_artista(sb: Client, artista: dict, stats: dict) -> list[dict]:
+    """SCD Tipo 2: cierra la fila vigente e inserta una nueva si cambió la popularidad."""
+    nombre = artista["nombre"]
+    oyentes, reproducciones = stats["oyentes"], stats["reproducciones"]
+    nivel = clasificar_popularidad(oyentes)
 
-for cancion in paquete_canciones:
-  res_cancion = (
-      supabase.table("dim_cancion")
-      .select("id_cancion")
-      .eq("titulo", cancion["titulo"])
-      .execute()
-  )
-  if not res_cancion.data:
-    res_cancion = (
-        supabase.table("dim_cancion")
-        .insert({"titulo": cancion["titulo"], "nombre_album": cancion["album"]})
-        .execute()
-    )
-  id_cancion_db = res_cancion.data[0]["id_cancion"]
+    nueva = {
+        "nombre": nombre, "genero_principal": artista["genero"], "mbid": artista["mbid"],
+        "oyentes_globales": oyentes, "reproducciones_globales": reproducciones,
+        "nivel_popularidad": nivel, "fecha_desde": str(HOY), "fecha_hasta": None, "es_actual": True,
+    }
+    versiones = versiones_artista(sb, nombre)
+    actual = next((v for v in versiones if v["es_actual"]), None)
 
-  supabase.table("fact_reproducciones").insert({
-      "id_artista": id_artista_db,
-      "id_fecha": id_fecha_hoy_db,
-      "id_cancion": id_cancion_db,
-      "cantidad_oyentes": cancion["oyentes"],
-      "total_reproducciones": cancion["reproducciones"],
-  }).execute()
+    if actual is None:
+        sb.table("dim_artista").insert(nueva).execute()
+        print(f"   🆕 Versión inicial SCD2 ({oyentes:,} oyentes, {nivel})")
+    elif oyentes > 0:
+        previos = actual.get("oyentes_globales") or 0
+        cambio_relativo = abs(oyentes - previos) / previos if previos else 1.0
+        if nivel != actual.get("nivel_popularidad") or cambio_relativo >= UMBRAL_CAMBIO_OYENTES:
+            if actual["fecha_desde"] == str(HOY):
+                # Ya hay una versión abierta hoy: se corrige en lugar de versionar de nuevo
+                sb.table("dim_artista").update({
+                    "oyentes_globales": oyentes, "reproducciones_globales": reproducciones,
+                    "nivel_popularidad": nivel, "mbid": artista["mbid"],
+                }).eq("id_artista", actual["id_artista"]).execute()
+            else:
+                sb.table("dim_artista").update(
+                    {"fecha_hasta": str(HOY), "es_actual": False}
+                ).eq("id_artista", actual["id_artista"]).execute()
+                try:
+                    sb.table("dim_artista").insert(nueva).execute()
+                except Exception:
+                    # Si falla el alta, reabrimos la versión para no dejar al artista sin fila vigente
+                    sb.table("dim_artista").update(
+                        {"fecha_hasta": None, "es_actual": True}
+                    ).eq("id_artista", actual["id_artista"]).execute()
+                    raise
+            print(f"   🔁 SCD2: {previos:,} → {oyentes:,} oyentes ({actual['nivel_popularidad']} → {nivel})")
+        else:
+            print(f"   ✔️ Sin cambios significativos ({oyentes:,} oyentes, {nivel})")
+    return versiones_artista(sb, nombre)
 
-# C. Cargar FACTS de CONCIERTOS
-print("Subiendo historial y cartelera de conciertos...")
-todos_los_conciertos = paquete_conciertos_pasados + paquete_conciertos_futuros
 
-for show in todos_los_conciertos:
-  if not show:
-    continue
+def asegurar_fecha(sb: Client, d: date, cache: set) -> int:
+    id_f = id_fecha_de(d)
+    if id_f not in cache:
+        sb.table("dim_fecha").upsert({
+            "id_fecha": id_f, "anio": d.year, "mes": d.month, "dia": d.day,
+            "trimestre": (d.month - 1) // 3 + 1, "fecha": str(d),
+        }, on_conflict="id_fecha").execute()
+        cache.add(id_f)
+    return id_f
 
-  res_ubi = (
-      supabase.table("dim_ubicacion")
-      .select("id_ubicacion")
-      .eq("ciudad", show["ciudad"])
-      .execute()
-  )
-  if not res_ubi.data:
-    res_ubi = (
-        supabase.table("dim_ubicacion")
-        .insert({"ciudad": show["ciudad"], "pais": show["pais"]})
-        .execute()
-    )
-  id_ubi_db = res_ubi.data[0]["id_ubicacion"]
 
-  id_fecha_show = obtener_id_fecha(show["fecha"])
-  supabase.table("fact_conciertos").insert({
-      "id_artista": id_artista_db,
-      "id_fecha": id_fecha_show,
-      "id_ubicacion": id_ubi_db,
-      "cantidad_canciones_tocadas": show.get("cantidad_canciones_tocadas", 0),
-      "show_realizado": show.get("show_realizado", 1),
-  }).execute()
+def asegurar_ubicacion(sb: Client, ciudad: str, pais: str, cache: dict) -> int:
+    clave = (ciudad, pais)
+    if clave not in cache:
+        sb.table("dim_ubicacion").upsert(
+            {"ciudad": ciudad, "pais": pais}, on_conflict="ciudad,pais"
+        ).execute()
+        res = sb.table("dim_ubicacion").select("id_ubicacion").eq("ciudad", ciudad).eq("pais", pais).execute()
+        cache[clave] = res.data[0]["id_ubicacion"]
+    return cache[clave]
 
-print(
-    "\n✅ ¡ETL COMPLETADO CON ÉXITO! Todos los datos están en tu Data Warehouse."
-)
+
+def asegurar_cancion(sb: Client, artista: str, titulo: str, api_key: str) -> int:
+    res = sb.table("dim_cancion").select("id_cancion").eq("titulo", titulo).eq("artista", artista).execute()
+    if res.data:
+        return res.data[0]["id_cancion"]
+    album = extraer_album(artista, titulo, api_key)
+    ins = sb.table("dim_cancion").insert(
+        {"titulo": titulo, "nombre_album": album, "artista": artista}
+    ).execute()
+    return ins.data[0]["id_cancion"]
+
+
+# ==========================================
+# CARGA: HECHOS
+# ==========================================
+def cargar_reproducciones(sb, artista, id_artista, canciones, id_fecha_hoy, lastfm_key):
+    filas = []
+    for c in canciones:
+        filas.append({
+            "id_artista": id_artista,
+            "id_fecha": id_fecha_hoy,
+            "id_cancion": asegurar_cancion(sb, artista["nombre"], c["titulo"], lastfm_key),
+            "cantidad_oyentes": c["oyentes"],
+            "total_reproducciones": c["reproducciones"],
+        })
+    if filas:
+        sb.table("fact_reproducciones").upsert(filas, on_conflict="id_artista,id_fecha,id_cancion").execute()
+    print(f"   🎵 {len(filas)} canciones cargadas")
+
+
+def cargar_conciertos(sb, versiones, shows, cache_fechas, cache_ubi):
+    filas = {}
+    for s in shows:
+        fila = {
+            "id_artista": resolver_version(versiones, s["fecha"]),
+            "id_fecha": asegurar_fecha(sb, s["fecha"], cache_fechas),
+            "id_ubicacion": asegurar_ubicacion(sb, s["ciudad"], s["pais"], cache_ubi),
+            "cantidad_canciones_tocadas": s["cantidad_canciones_tocadas"],
+            "show_realizado": s["show_realizado"],
+        }
+        filas[(fila["id_artista"], fila["id_fecha"], fila["id_ubicacion"])] = fila
+    if filas:
+        sb.table("fact_conciertos").upsert(
+            list(filas.values()), on_conflict="id_artista,id_fecha,id_ubicacion"
+        ).execute()
+    print(f"   🎤 {len(filas)} conciertos cargados")
+
+
+# ==========================================
+# ORQUESTACIÓN
+# ==========================================
+def procesar_artista(sb, artista, claves, cache_fechas, cache_ubi):
+    print(f"\n🎧 {artista['nombre']}")
+    stats = extraer_lastfm_artista(artista["nombre"], claves["lastfm"])
+    versiones = aplicar_scd2_artista(sb, artista, stats) if stats["oyentes"] > 0 else versiones_artista(sb, artista["nombre"])
+    if not versiones:
+        raise RuntimeError("Last.fm no devolvió estadísticas y el artista no existe aún en dim_artista")
+    id_actual = resolver_version(versiones, HOY)
+
+    canciones = extraer_lastfm_top_canciones(artista["nombre"], claves["lastfm"])
+    id_fecha_hoy = asegurar_fecha(sb, HOY, cache_fechas)
+    cargar_reproducciones(sb, artista, id_actual, canciones, id_fecha_hoy, claves["lastfm"])
+
+    shows = extraer_shows_pasados(artista, claves["setlist"])
+    time.sleep(0.6)  # Setlist.fm: máximo ~2 requests/segundo
+    shows += extraer_shows_futuros(artista, claves["ticketmaster"])
+    cargar_conciertos(sb, versiones, shows, cache_fechas, cache_ubi)
+
+
+def main() -> int:
+    claves = {
+        "lastfm": leer_entorno("LASTFM_KEY"),
+        "setlist": leer_entorno("SETLIST_KEY"),
+        "ticketmaster": leer_entorno("TICKETMASTER_KEY"),
+    }
+    sb = create_client(leer_entorno("SUPABASE_URL"), leer_entorno("SUPABASE_KEY"))
+
+    print(f"🚀 ETL {HOY} — {len(ARTISTAS)} artistas")
+    cache_fechas: set = set()
+    cache_ubi: dict = {}
+    fallidos = []
+    for artista in ARTISTAS:
+        try:
+            procesar_artista(sb, artista, claves, cache_fechas, cache_ubi)
+        except Exception as exc:  # un artista con error no debe frenar a los demás
+            print(f"   ❌ Error con {artista['nombre']}: {exc}")
+            fallidos.append(artista["nombre"])
+
+    if fallidos:
+        print(f"\n⚠️ ETL terminó con errores en: {', '.join(fallidos)}")
+        return 1
+    print("\n✅ ETL completado: Data Warehouse actualizado.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

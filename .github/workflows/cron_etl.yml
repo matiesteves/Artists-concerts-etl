@@ -1,34 +1,40 @@
-name: Camion ETL Diario Bad Bunny
+name: ETL Diario Artistas y Conciertos
 
 on:
   schedule:
-    # ⏰ Corre todos los días a las 23:00 UTC (Aproximadamente 20:00 hs de Argentina)
-    - cron: '0 23 * * *'
-  workflow_dispatch: # 👈 Esto nos permite darle un botón de "Play" manual para probarlo
+    - cron: "0 23 * * *" # 23:00 UTC (~20:00 hs Argentina)
+  workflow_dispatch: # ejecución manual desde la pestaña Actions
+
+permissions:
+  contents: read
+
+concurrency:
+  group: etl
+  cancel-in-progress: false
 
 jobs:
   run-etl:
-    runs-on: ubuntu-latest # Arma una computadora virtual con Linux gratis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-    - name: Copiar el repositorio
-      uses: actions/checkout@v4
+      - name: Copiar el repositorio
+        uses: actions/checkout@v4
 
-    - name: Configurar Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.14' # 👈 Ajustado a tu versión de desarrollo
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
 
-    - name: Instalar librerias necesarias
-      run: |
-        pip install requests supabase
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
 
-    - name: Ejecutar camión ETL 🚛
-      env:
-        # Conectamos las variables del script con la caja fuerte de GitHub
-        LASTFM_KEY: ${{ secrets.LASTFM_KEY }}
-        SETLIST_KEY: ${{ secrets.SETLIST_KEY }}
-        TICKETMASTER_KEY: ${{ secrets.TICKETMASTER_KEY }}
-        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-      run: python etl.py
+      - name: Ejecutar ETL
+        env:
+          LASTFM_KEY: ${{ secrets.LASTFM_KEY }}
+          SETLIST_KEY: ${{ secrets.SETLIST_KEY }}
+          TICKETMASTER_KEY: ${{ secrets.TICKETMASTER_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python etl.py
