@@ -33,7 +33,7 @@ jobs:
       - name: Ejecutar ETL
         env:
           LASTFM_KEY: ${{ secrets.LASTFM_KEY }}
-          SETLIST_KEY: ${{ secrets.SETLIST_KEY }}
+          SETLISTFM_KEY: ${{ secrets.SETLISTFM_KEY }}
           TICKETMASTER_KEY: ${{ secrets.TICKETMASTER_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}

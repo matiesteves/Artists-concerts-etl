@@ -356,7 +356,7 @@ def procesar_artista(sb, artista, claves, cache_fechas, cache_ubi):
 def main() -> int:
     claves = {
         "lastfm": leer_entorno("LASTFM_KEY"),
-        "setlist": leer_entorno("SETLIST_KEY"),
+        "setlist": leer_entorno("SETLISTFM_KEY"),
         "ticketmaster": leer_entorno("TICKETMASTER_KEY"),
     }
     sb = create_client(leer_entorno("SUPABASE_URL"), leer_entorno("SUPABASE_KEY"))
